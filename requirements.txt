@@ -1,0 +1,30 @@
+# Smart Cane -- Python packages (Raspberry Pi OS Bookworm)
+#   python -m venv --system-site-packages venv && source venv/bin/activate
+#   pip install -r requirements.txt
+#
+# No versions pinned on purpose: once it works on your Pi, run
+# `pip freeze > requirements.lock` to lock the exact versions you tested.
+
+# detection + tracking (local_detector.py, detection_common.py)
+ultralytics        # YOLO + ByteTrack; also pulls in numpy
+ncnn               # runtime for the NCNN model export (models/yolo26n_ncnn_model)
+lapx               # tracker dependency (ByteTrack); avoids a failed auto-install offline
+
+# camera + QR (ai_stream.py, cane_boot.py)
+opencv-python      # on a Pi you may prefer: sudo apt install python3-opencv
+
+# live view page (ai_stream.py)
+flask
+
+# Supabase heartbeat + pairing (cane_cloud.py, cane_boot.py)
+requests
+
+# offline speech (pi_audio.py)
+piper-tts
+
+# ----------------------------------------------------------------------
+# NOT installable with pip -- install with apt:
+#   sudo apt install alsa-utils        # `aplay`, used to play the speech
+#   sudo apt install network-manager   # `nmcli` for Wi-Fi (already on Bookworm)
+# Also needed: a Piper voice (.onnx + .onnx.json) inside ./piper/voices/
+# ----------------------------------------------------------------------
