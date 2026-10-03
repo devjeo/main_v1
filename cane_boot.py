@@ -56,11 +56,12 @@ INTERNET_WAIT_S = 20
 PHRASE_NEEDS_SETUP = "Setup needed. Open the Smart Cane app and show the setup code to the camera."
 PHRASE_RECEIVED = "Code received. Connecting to your hotspot."
 PHRASE_BAD_QR = "That is not a Smart Cane setup code."
+PHRASE_NEEDS_WIFI = "No Wi-Fi found. Turn on your hotspot, then show the setup code to the camera."
 PHRASE_NO_WIFI = "I could not connect to your hotspot. Turn it on, then show the code again."
 PHRASE_NO_NET = "Connected, but there is no internet. Check your hotspot, then show a new code."
 PHRASE_FAIL = "Pairing failed. Please show a new code from the app."
 PHRASE_DONE = "Pairing complete. Your cane is ready."
-SETUP_PHRASES = [PHRASE_NEEDS_SETUP, PHRASE_RECEIVED, PHRASE_BAD_QR,
+SETUP_PHRASES = [PHRASE_NEEDS_SETUP, PHRASE_NEEDS_WIFI, PHRASE_RECEIVED, PHRASE_BAD_QR,
                  PHRASE_NO_WIFI, PHRASE_NO_NET, PHRASE_FAIL, PHRASE_DONE]
 
 
@@ -181,13 +182,70 @@ def _run(cmd, timeout: float = 20):
         return subprocess.CompletedProcess(cmd, 1, "", str(e))
 
 
-def wifi_connected() -> bool:
-    r = _run(["nmcli", "-t", "-f", "TYPE,STATE", "device"], timeout=5)
+def _unescape(s: str) -> str:
+    """nmcli -t escapes ':' and '\\' inside fields."""
+    return s.replace("\\:", ":").replace("\\\\", "\\")
+
+
+def wifi_ssid() -> Optional[str]:
+    """Name of the Wi-Fi network the cane is actually joined to as a client,
+    or None. Ethernet never counts, and neither does the Pi broadcasting its
+    own access point (mode=ap)."""
+    r = _run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"], timeout=5)
     for line in r.stdout.splitlines():
-        kind, _, state = line.partition(":")
-        if kind == "wifi" and state.startswith("connected"):
-            return True
-    return False
+        parts = line.split(":", 3)
+        if len(parts) < 4:
+            continue
+        _dev, kind, state, conn = parts
+        if kind != "wifi" or state != "connected" or not conn:
+            continue
+        name = _unescape(conn)
+        mode = _run(["nmcli", "-g", "802-11-wireless.mode", "connection", "show", "id", name],
+                    timeout=5).stdout.strip()
+        if mode in ("", "infrastructure"):
+            return name
+    return None
+
+
+def wifi_connected() -> bool:
+    return wifi_ssid() is not None
+
+
+def enforce_wireless_only() -> None:
+    """A network cable may stay plugged in (SSH / LAN) but must never be the
+    cane's internet path. Marks every ethernet profile never-default so the
+    only default route can be Wi-Fi. Best effort; needs NetworkManager rights."""
+    r = _run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"], timeout=5)
+    changed = False
+    for line in r.stdout.splitlines():
+        name, _, kind = line.rpartition(":")
+        if kind != "802-3-ethernet":
+            continue
+        name = _unescape(name)
+        v4 = _run(["nmcli", "-g", "ipv4.never-default", "connection", "show", "id", name], timeout=5).stdout.strip()
+        v6 = _run(["nmcli", "-g", "ipv6.never-default", "connection", "show", "id", name], timeout=5).stdout.strip()
+        if v4 == "yes" and v6 == "yes":
+            continue
+        m = _run(["nmcli", "connection", "modify", "id", name,
+                  "ipv4.never-default", "yes", "ipv6.never-default", "yes"], timeout=10)
+        if m.returncode != 0:
+            logger.warning("Could not make %r wired-for-LAN-only: %s", name, (m.stderr or m.stdout).strip())
+            continue
+        changed = True
+    if changed:
+        d = _run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"], timeout=5)
+        for line in d.stdout.splitlines():
+            dev, _, kind = line.partition(":")
+            if kind == "ethernet":
+                _run(["nmcli", "device", "reapply", dev], timeout=15)
+        print("[boot] ethernet set to LAN-only (it will not be used for internet)")
+
+
+def _default_routes_wireless_only() -> bool:
+    """True when every IPv4 default route goes out a wireless interface."""
+    out = _run(["ip", "-4", "route", "show", "default"], timeout=5).stdout
+    devs = re.findall(r"\bdev (\S+)", out)
+    return bool(devs) and all(d.startswith("wl") for d in devs)
 
 
 def saved_wifi_profiles():
@@ -210,17 +268,23 @@ def wait_for_wifi(seconds: float) -> bool:
 
 
 def join_wifi(ssid: str, password: str):
-    """Joins and saves (autoconnect) the network. Returns (ok, message)."""
-    _run(["nmcli", "connection", "delete", "id", ssid])  # so a changed password takes effect
-    message = ""
-    # wpa-psk covers WPA2 and WPA2/WPA3 mixed; sae is WPA3-only.
-    # Hidden is tried last because it makes nmcli probe for the SSID directly.
+    """Joins and saves (autoconnect) the network. Returns (ok, message).
+
+    Builds the profile explicitly (key-mgmt set) instead of relying on
+    `nmcli device wifi connect`, which fails with "key-mgmt: property is
+    missing" when the SSID isn't in the scan cache or its security flags
+    can't be read (hotspots, hidden SSIDs, WPA3 mixed mode).
+    """
+    # wpa-psk covers WPA2 and WPA2/WPA3 mixed; sae is WPA3-only; the last
+    # variant marks the network hidden so nmcli probes for the SSID directly.
     variants = [("wpa-psk", False), ("sae", False), ("wpa-psk", True)]
+    message = ""
     for attempt in range(1, WIFI_JOIN_ATTEMPTS + 1):
+        # Delete any old profile first so a changed password takes effect.
+        _run(["nmcli", "connection", "delete", "id", ssid])
         _run(["nmcli", "device", "wifi", "rescan"])
         time.sleep(3)
         key_mgmt, hidden = variants[(attempt - 1) % len(variants)]
-        _run(["nmcli", "connection", "delete", "id", ssid])
         add = ["nmcli", "connection", "add", "type", "wifi",
                "con-name", ssid, "ssid", ssid,
                "connection.autoconnect", "yes",
@@ -254,6 +318,23 @@ def wait_for_internet(base_url: str, seconds: float = INTERNET_WAIT_S) -> bool:
     return False
 
 
+def wait_for_wireless_internet(base_url: str, seconds: float = INTERNET_WAIT_S) -> bool:
+    """Internet counts only if the cane is joined to a Wi-Fi network AND the
+    traffic would leave over Wi-Fi. A cable alone never passes."""
+    if not shutil.which("nmcli"):
+        return wait_for_internet(base_url, seconds)   # dev machine
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if wifi_ssid() and _default_routes_wireless_only():
+            try:
+                requests.get(base_url, timeout=4)
+                return True
+            except requests.RequestException:
+                pass
+        time.sleep(2)
+    return False
+
+
 class ClaimError(Exception):
     pass
 
@@ -282,6 +363,33 @@ def claim_device(base_url: str, anon_key: str, device_id: str, token: str) -> st
     return secret
 
 
+def registration_status(base_url: str, anon_key: str, device_id: str, secret: str) -> Optional[bool]:
+    """Asks the server whether it still accepts this device (device_heartbeat
+    validates the id + secret server-side).
+
+    True  = server accepts it.
+    False = server explicitly rejected it (deleted / unpaired / bad secret).
+    None  = can't tell (offline, 5xx, auth/config problems) -- never treat
+            this as "unpaired", or an offline cane would wipe its own pairing.
+    """
+    try:
+        r = requests.post(
+            f"{base_url}/rest/v1/rpc/device_heartbeat",
+            headers={"apikey": anon_key, "Authorization": f"Bearer {anon_key}",
+                     "Content-Type": "application/json"},
+            json={"p_device_id": device_id, "p_secret": secret, "p_battery": None},
+            timeout=8,
+        )
+    except requests.RequestException:
+        return None
+    if r.ok:
+        return True
+    if 400 <= r.status_code < 500 and r.status_code not in (401, 403, 404, 408, 429):
+        logger.warning("Server rejected this device: HTTP %d: %s", r.status_code, r.text[:200])
+        return False
+    return None
+
+
 # ----------------------------------------------------------------------
 # pairing
 # ----------------------------------------------------------------------
@@ -301,9 +409,16 @@ def try_pair(payload: Dict[str, str], say) -> bool:
         logger.warning("Could not join hotspot %r: %s", payload["ssid"], message)
         say(PHRASE_NO_WIFI)
         return False
-    if not wait_for_internet(base_url):
+    if not wait_for_wireless_internet(base_url):
         say(PHRASE_NO_NET)
         return False
+
+    existing = env.get("CANE_DEVICE_SECRET")
+    if existing and registration_status(base_url, anon_key, device_id, existing) is True:
+        # Already paired and the server knows us: this code only added a Wi-Fi network.
+        logger.info("Already paired as %s; Wi-Fi network added", device_id)
+        say(PHRASE_DONE)
+        return True
 
     secret = None
     for attempt in range(1, 4):
@@ -325,8 +440,11 @@ def try_pair(payload: Dict[str, str], say) -> bool:
     return True
 
 
-def pair_with_qr(say) -> bool:
-    """Scans the camera until a valid QR pairs the cane. Ctrl+C to quit."""
+def pair_with_qr(say, prompt: str = PHRASE_NEEDS_SETUP, stop_if_wifi: bool = False) -> bool:
+    """Scans the camera until a valid QR pairs the cane. Ctrl+C to quit.
+
+    stop_if_wifi: for an already-paired cane waiting for a network -- also
+    return once a saved Wi-Fi network comes back into range on its own."""
     import cv2
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
@@ -337,7 +455,7 @@ def pair_with_qr(say) -> bool:
         print("Could not open the camera (/dev/video0).")
         return False
 
-    last_remind = last_scan = last_bad = float("-inf")
+    last_remind = last_scan = last_bad = last_wifi = float("-inf")
     last_text, ignore_until = None, 0.0
     try:
         while True:
@@ -348,7 +466,12 @@ def pair_with_qr(say) -> bool:
             now = time.monotonic()
             if now - last_remind >= REMIND_EVERY_S:
                 last_remind = now
-                say(PHRASE_NEEDS_SETUP)
+                say(prompt)
+            if stop_if_wifi and now - last_wifi >= 3:
+                last_wifi = now
+                if wifi_ssid():
+                    logger.info("A saved Wi-Fi network came back; leaving setup")
+                    return True
             if now - last_scan < SCAN_INTERVAL_S:
                 continue
             last_scan = now
@@ -409,16 +532,46 @@ def main():
     connect_speaker()   # so the setup prompts and the stream speak through it
 
     if have_nmcli:
+        enforce_wireless_only()
         profiles = saved_wifi_profiles()
         print(f"[boot] saved Wi-Fi profiles: {profiles or 'none'}")
         if profiles:
             print("[boot] waiting for Wi-Fi...")
-            print("[boot] connected" if wait_for_wifi(WIFI_WAIT_S) else "[boot] no saved network in range")
+            wait_for_wifi(WIFI_WAIT_S)
+        ssid = wifi_ssid()
+        if ssid:
+            print(f"[boot] Wi-Fi connected: {ssid}")
+        else:
+            print("[boot] no Wi-Fi connection (a network cable does not count)")
     else:
         print("[boot] nmcli not found -- skipping Wi-Fi/pairing (dev machine?)")
 
-    if have_nmcli and not read_env().get("CANE_DEVICE_SECRET"):
-        print("[boot] cane not paired -> starting QR setup")
+    env = read_env()
+    needs_setup = not env.get("CANE_DEVICE_SECRET")
+    needs_wifi = have_nmcli and wifi_ssid() is None
+    base = (env.get("SUPABASE_URL") or "").rstrip("/")
+    if not needs_setup and not needs_wifi and base and env.get("SUPABASE_ANON_KEY"):
+        # Paired on paper -- confirm the server still knows this cane. Offline
+        # or unclear answers keep the pairing so the cane still works locally.
+        if wait_for_wireless_internet(base, seconds=8):
+            status = registration_status(base, env["SUPABASE_ANON_KEY"],
+                                         get_device_id(env), env["CANE_DEVICE_SECRET"])
+            if status is False:
+                print("[boot] server no longer recognises this cane -> pairing again")
+                update_env_file({"CANE_DEVICE_SECRET": ""})
+                needs_setup = True
+            elif status is None:
+                print("[boot] could not verify pairing with the server (continuing)")
+        else:
+            print("[boot] offline -- skipping pairing check")
+
+    if have_nmcli and (needs_setup or needs_wifi):
+        if needs_setup:
+            print("[boot] cane not paired -> starting QR setup")
+            prompt = PHRASE_NEEDS_SETUP
+        else:
+            print("[boot] no Wi-Fi -> waiting for a setup code to add a network")
+            prompt = PHRASE_NEEDS_WIFI
         audio = None
         say = lambda text: print(f"[setup] {text}")
         try:
@@ -430,7 +583,7 @@ def main():
         except Exception as e:   # no voice -> print-only is fine for setup
             print(f"[warn] No speech ({e}); showing messages on screen only.")
         try:
-            if not pair_with_qr(say):
+            if not pair_with_qr(say, prompt=prompt, stop_if_wifi=not needs_setup):
                 sys.exit(1)
             if audio is not None:
                 wait_until_spoken(audio)
@@ -444,7 +597,7 @@ def main():
 
     url = (read_env().get("SUPABASE_URL") or "").rstrip("/")
     if url:
-        online = wait_for_internet(url, seconds=5)
+        online = wait_for_wireless_internet(url, seconds=5)
         print(f"[boot] internet: {'OK' if online else 'offline (will keep working locally)'}")
 
     print("[boot] starting ai_stream.py")
