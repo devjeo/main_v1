@@ -13,7 +13,9 @@ What it does, all on the Raspberry Pi (no laptop, no server):
   3. Browser view: open http://<pi-ip>:5000/ for the live annotated video
      (boxes + labels + IDs). Detection and speech run all the time in the
      background -- they do NOT depend on anyone having the page open.
-  4. Online status: a heartbeat tells Supabase the cane is alive, and
+  4. Alerts: a hold-to-fire SOS button and camera-fault alerts are queued on
+     disk and sent to Supabase (cane_alerts.py), even after Wi-Fi returns.
+  5. Online status: a heartbeat tells Supabase the cane is alive, and
      marks it offline on a normal shutdown (cane_cloud.py). Skipped with a
      note if cane.env isn't set up.
 
@@ -30,6 +32,7 @@ import time
 import cv2
 from flask import Flask, Response
 
+from cane_alerts import CaneAlerts
 from cane_cloud import CaneCloud
 from local_detector import LocalTracker
 from narration_common import template_narrate
@@ -109,7 +112,7 @@ def draw_boxes(frame, detections):
 # ----------------------------------------------------------------------
 # background loop: capture -> detect -> gather -> speak (+ feed the browser)
 # ----------------------------------------------------------------------
-def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s):
+def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, alerts=None):
     min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
     read_failures = 0
 
@@ -121,6 +124,8 @@ def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s):
                 read_failures += 1
                 if read_failures == 30:
                     logger.warning("Camera isn't returning frames -- check the connection.")
+                    if alerts is not None:
+                        alerts.emergency("fault", "Camera stopped returning frames")
                 announcer.poll()  # keep the window clock honest even without frames
                 time.sleep(0.1)
                 continue
@@ -269,10 +274,15 @@ def main(args):
     except AudioError as e:
         print(f"[warn] Speech disabled: {e}\n       (video + detection will still run)")
 
+    # SOS button + queued emergency/log uploads to Supabase (works offline, sends later).
+    alerts = CaneAlerts(cloud, audio=audio)
+    alerts.start()
+    alerts.log("info", "Cane started")
+
     stop = threading.Event()
     worker = threading.Thread(
         target=detection_loop,
-        args=(stop, cap, detector, announcer, audio, args.max_fps, args.cooldown),
+        args=(stop, cap, detector, announcer, audio, args.max_fps, args.cooldown, alerts),
         name="detection", daemon=True,
     )
     worker.start()
@@ -288,6 +298,7 @@ def main(args):
         cap.release()
         if audio is not None:
             audio.stop()
+        alerts.stop()
         cloud.shutdown()
 
 
