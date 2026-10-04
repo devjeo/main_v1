@@ -253,14 +253,17 @@ def parse_args():
 
 
 def main(args):
+    # Camera FIRST. If it can't open we exit before touching Supabase; otherwise
+    # a crash-restart loop would flip the cane online/offline every few seconds
+    # (heartbeat on, shutdown hook off, repeat) and spam "Device offline" logs.
+    cap = open_camera()
+    if not cap.isOpened():
+        sys.exit("Could not open the camera (/dev/video0). Is it plugged in?")
+
     # Online-status heartbeat (does nothing, with a note, if cane.env is missing).
     cloud = CaneCloud()
     cloud.install_shutdown_hooks()  # must happen on the main thread
     cloud.start()
-
-    cap = open_camera()
-    if not cap.isOpened():
-        sys.exit("Could not open the camera (/dev/video0). Is it plugged in?")
 
     detector = LocalTracker(model_path=args.model, confidence=args.conf,
                             imgsz=args.imgsz, tracker=args.tracker,
