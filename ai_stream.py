@@ -42,6 +42,24 @@ from pi_audio import AudioError, AudioOutput, Priority
 MODEL_PATH = "models/yolo26n_ncnn_model"   # your NCNN export
 PIPER_DIR = "./piper"                      # folder containing voices/
 TTS_CACHE_DIR = "./tts_cache"              # spoken phrases are cached here across restarts
+
+# Only these objects are announced AND drawn in the browser view. Everything
+# else the model can detect is ignored. Names must match the model's class
+# names exactly (COCO names). Use --all-objects to switch the filter off.
+ALLOWED_LABELS = {
+    "person", "bicycle", "car", "motorcycle", "truck",
+    "traffic light", "fire hydrant", "stop sign", "bench",
+    "cat", "dog",
+    "backpack", "umbrella", "handbag", "sports ball", "bottle",
+    "chair", "couch", "potted plant", "dining table",
+    "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+    # --- suggested extras (uncomment the ones you want) ---
+    # "bus", "train",                      # big vehicles
+    # "bed", "toilet", "refrigerator", "sink",   # indoor landmarks
+    # "suitcase", "skateboard",            # trip hazards
+    # "parking meter",                     # street-side obstacle
+    # "horse", "cow", "sheep",             # large animals
+}
 HOST = "0.0.0.0"
 PORT = 5000
 # ---------------------------------------------------------------------
@@ -223,6 +241,8 @@ def parse_args():
     p.add_argument("--cooldown", type=float, default=10.0, help="seconds before the SAME object ID may be spoken again")
     p.add_argument("--tracker", default="bytetrack.yaml",
                    help="bytetrack.yaml (lighter) or botsort.yaml (better with camera motion, more CPU)")
+    p.add_argument("--all-objects", action="store_true",
+                   help="ignore ALLOWED_LABELS and report every class the model knows")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -238,7 +258,8 @@ def main(args):
         sys.exit("Could not open the camera (/dev/video0). Is it plugged in?")
 
     detector = LocalTracker(model_path=args.model, confidence=args.conf,
-                            imgsz=args.imgsz, tracker=args.tracker)
+                            imgsz=args.imgsz, tracker=args.tracker,
+                            labels=None if args.all_objects else ALLOWED_LABELS)
     announcer = ObjectAnnouncer(window_s=args.window, cooldown_s=args.cooldown)
 
     audio = None

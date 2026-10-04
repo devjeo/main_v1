@@ -33,7 +33,14 @@ class LocalTracker:
         confidence: float = 0.5,
         imgsz: int = 320,
         tracker: str = "bytetrack.yaml",
+        labels=None,
     ):
+        """
+        labels: optional collection of class NAMES (e.g. {"person", "chair"}).
+        When given, ONLY these objects are ever returned -- so they are the
+        only ones announced AND the only ones drawn in the browser view.
+        None means no filtering (every class the model knows).
+        """
         from ultralytics import YOLO  # imported here so the other modules stay importable without it
 
         self.confidence = confidence
@@ -42,6 +49,22 @@ class LocalTracker:
         logger.info("Loading model %s (imgsz=%d, conf=%.2f, tracker=%s)",
                     model_path, imgsz, confidence, tracker)
         self.model = YOLO(model_path, task="detect")
+
+        # Label filter. Matching is by NAME against the model's own class
+        # list, so it can't drift out of sync with the model's numeric IDs.
+        self.labels = None
+        self.class_ids = None
+        if labels is not None:
+            self.labels = set(labels)
+            names = self.model.names  # {class_id: name}
+            self.class_ids = sorted(i for i, n in names.items() if n in self.labels)
+            unknown = sorted(self.labels - set(names.values()))
+            if unknown:
+                logger.warning("These labels are NOT in this model and will never match: %s", unknown)
+            if not self.class_ids:
+                logger.warning("None of the requested labels exist in this model -- nothing will be reported!")
+            logger.info("Label filter on: reporting %d of %d classes",
+                        len(self.class_ids), len(names))
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
         """
@@ -56,6 +79,7 @@ class LocalTracker:
             imgsz=self.imgsz,
             persist=True,
             tracker=self.tracker,
+            classes=self.class_ids or None,   # skip unwanted classes inside YOLO (None = all)
             verbose=False,
         )
 
@@ -63,9 +87,12 @@ class LocalTracker:
         frame_width = frame.shape[1]
         for result in results:
             for box in result.boxes:
+                label = self.model.names[int(box.cls[0])]
+                if self.labels is not None and label not in self.labels:
+                    continue
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 detections.append(Detection(
-                    label=self.model.names[int(box.cls[0])],
+                    label=label,
                     confidence=round(float(box.conf[0]), 3),
                     bbox=[round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
                     position=bbox_position((x1 + x2) / 2, frame_width),

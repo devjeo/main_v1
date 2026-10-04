@@ -1,0 +1,107 @@
+[
+  {
+    "text": "Drop-off ahead",
+    "file": "b3d205c30a9501e170f8.wav",
+    "objects": null
+  },
+  {
+    "text": "Obstacle ahead",
+    "file": "ed5c864d102ec4f30720.wav",
+    "objects": null
+  },
+  {
+    "text": "Low overhead, duck",
+    "file": "7a60167cf7d21e152594.wav",
+    "objects": null
+  },
+  {
+    "text": "Stop! Drop-off right in front of you",
+    "file": "126a09a4d8bccb1c9bda.wav",
+    "objects": null
+  },
+  {
+    "text": "Stop! Obstacle very close",
+    "file": "8c8b6b90abc7fc3ecbf5.wav",
+    "objects": null
+  },
+  {
+    "text": "Duck now!",
+    "file": "f1cb35aac9519d27a524.wav",
+    "objects": null
+  },
+  {
+    "text": "Emergency alert triggered",
+    "file": "c39eac7423c5dfd54e8a.wav",
+    "objects": null
+  },
+  {
+    "text": "2 vases to your right",
+    "file": "e3c67dbf3dcff6e0ca0f.wav",
+    "objects": null
+  },
+  {
+    "text": "vase to your right",
+    "file": "0541fc5544be11000a11.wav",
+    "objects": null
+  },
+  {
+    "text": "crosswalk to your left, vase to your right",
+    "file": "edda82e3cc467567ab5f.wav",
+    "objects": null
+  },
+  {
+    "text": "person to your left",
+    "file": "d242919bd87568d427bf.wav",
+    "objects": null
+  },
+  {
+    "text": "person ahead",
+    "file": "b3e08a0fdb5817f8a8dd.wav",
+    "objects": null
+  },
+  {
+    "text": "cat ahead",
+    "file": "4b7fd756c1ad403ffc5f.wav",
+    "objects": null
+  },
+  {
+    "text": "person ahead, crosswalk to your left, person to your right",
+    "file": "436f38f5ca0cc020d06a.wav",
+    "objects": null
+  },
+  {
+    "text": "person to your right",
+    "file": "861f1ffeba4cb878849e.wav",
+    "objects": null
+  },
+  {
+    "text": "crosswalk to your left, 2 persons to your right",
+    "file": "bed4972350618cc37787.wav",
+    "objects": null
+  },
+  {
+    "text": "crosswalk to your left",
+    "file": "aa2eeb94cfb183659282.wav",
+    "objects": null
+  },
+  {
+    "text": "crosswalk to your left, 2 vases to your right",
+    "file": "c22be02e028d003ff3d1.wav",
+    "objects": null
+  },
+  {
+    "text": "cat and person to your right",
+    "file": "baf7003a16e2d099083e.wav",
+    "objects": null
+  },
+  {
+    "text": "toothbrush ahead, vase to your right",
+    "file": "7d2246acb6d55ceb87ed.wav",
+    "objects": null
+  },
+  {
+    "text": "2 persons ahead, vase to your right",
+    "file": "5b5e2be147c48247dbba.wav",
+    "objects": null
+  }
+]
