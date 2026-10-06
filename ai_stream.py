@@ -6,9 +6,11 @@ ai_stream.py -- THE MAIN PROGRAM. Run this one file and everything starts:
 What it does, all on the Raspberry Pi (no laptop, no server):
 
   1. Camera + YOLO (NCNN) + tracker: every detected object gets an ID.
-  2. Speech: objects are gathered for 3 seconds, then the NEW ones are
-     spoken through Piper. The same object ID is never repeated within
-     10 seconds (a second phone is a new ID, so it IS announced).
+  2. Speech: new objects are gathered until the scene settles (2.5 s with no
+     new arrivals; 0.5 s for urgent ones like vehicles or a person straight
+     ahead), then spoken through Piper as ONE sentence describing the whole
+     current scene. The same object ID is never re-triggered within 10
+     seconds (a second phone is a new ID, so it IS announced).
      Rules live in object_announcer.py.
   3. Browser view: open http://<pi-ip>:5000/ for the live annotated video
      (boxes + labels + IDs). Detection and speech run all the time in the
@@ -151,10 +153,14 @@ def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, a
             result = announcer.poll()
             if result is not None:
                 if result.announce:
-                    text = template_narrate(result.announce)
+                    # Describe the WHOLE current scene (new + still-in-cooldown
+                    # objects) so counts are right: "4 persons ahead", not
+                    # "2 persons ahead" twice.
+                    scene = result.announce + result.suppressed
+                    text = template_narrate(scene)
                     print(f"[say]  {text}")
                     if audio is not None:
-                        audio.speak(text, Priority.NARRATION, objects=result.announce)
+                        audio.speak(text, Priority.NARRATION, objects=scene)
                 if result.suppressed:
                     held = ", ".join(f"{d.label}#{d.track_id}" for d in result.suppressed)
                     print(f"[held] announced < {cooldown_s:g}s ago: {held}")
@@ -256,7 +262,13 @@ def parse_args():
     p.add_argument("--conf", type=float, default=0.5, help="detection confidence threshold")
     p.add_argument("--imgsz", type=int, default=320, help="inference image size")
     p.add_argument("--max-fps", type=float, default=10, help="cap on detection frames/sec (leaves CPU for speech)")
-    p.add_argument("--window", type=float, default=3.0, help="gather window in seconds")
+    p.add_argument("--window", type=float, default=3.0, help="housekeeping interval (s) when nothing new is pending")
+    p.add_argument("--settle", type=float, default=2.5,
+                   help="speak after no NEW object has appeared for this many seconds")
+    p.add_argument("--urgent-settle", type=float, default=0.5,
+                   help="shorter settle (s) for urgent objects (vehicles, animals, a person straight ahead)")
+    p.add_argument("--max-wait", type=float, default=6.0,
+                   help="never hold new objects longer than this many seconds before speaking")
     p.add_argument("--cooldown", type=float, default=10.0, help="seconds before the SAME object ID may be spoken again")
     p.add_argument("--tracker", default="bytetrack.yaml",
                    help="bytetrack.yaml (lighter) or botsort.yaml (better with camera motion, more CPU)")
@@ -282,7 +294,9 @@ def main(args):
     detector = LocalTracker(model_path=args.model, confidence=args.conf,
                             imgsz=args.imgsz, tracker=args.tracker,
                             labels=None if args.all_objects else ALLOWED_LABELS)
-    announcer = ObjectAnnouncer(window_s=args.window, cooldown_s=args.cooldown)
+    announcer = ObjectAnnouncer(window_s=args.window, cooldown_s=args.cooldown,
+                                settle_s=args.settle, urgent_settle_s=args.urgent_settle,
+                                max_wait_s=args.max_wait)
 
     audio = None
     try:
@@ -306,7 +320,8 @@ def main(args):
     worker.start()
 
     print(f"\nRunning. Live view: http://<pi-ip>:{PORT}/   (Ctrl+C to stop)")
-    print(f"Gathering {args.window:g}s windows; same object ID won't repeat within {args.cooldown:g}s.\n")
+    print(f"Speaking after {args.settle:g}s of no new objects ({args.urgent_settle:g}s for urgent ones, "
+          f"max {args.max_wait:g}s); same object ID won't repeat within {args.cooldown:g}s.\n")
 
     try:
         app.run(host=HOST, port=PORT, debug=False, threaded=True)
