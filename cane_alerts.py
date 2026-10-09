@@ -4,7 +4,10 @@ with an on-disk queue so nothing is lost when Wi-Fi is down.
 
   * emergency(kind, ...)  -> RPC device_emergency   (kind: sos | fall | hazard | fault)
   * log(level, message)   -> RPC device_log         (level: info | warning | error)
-  * SOS button (optional) -> hold it ~1 s to fire emergency("sos")
+  * SOS button (optional) -> hold it ~1 s to fire emergency("sos") AND queue a
+                             photo of what the camera sees (frame_provider)
+  * photo                 -> sent to the cane-sos-photo Edge Function right after the
+                             SOS is delivered; the server attaches it to that SOS log
 
 How the queue works
   Every call is written to alerts_queue.jsonl FIRST, then a background thread
@@ -34,6 +37,9 @@ import requests
 _HERE = os.path.dirname(os.path.abspath(__file__))
 QUEUE_FILE = os.path.join(_HERE, "alerts_queue.jsonl")
 MAX_QUEUE = 200
+PHOTO_DIR = os.path.join(_HERE, "sos_photos")
+PHOTO_JPEG_QUALITY = 75
+PHOTO_MAX_TRIES = 4        # tries when the server says "no SOS log yet"
 SOS_PIN = 17               # BCM numbering
 SOS_HOLD_S = 1.0           # hold this long so a bump in a bag doesn't fire it
 SOS_LOCAL_COOLDOWN_S = 5.0 # ignore repeat presses inside this window
@@ -44,10 +50,13 @@ LEVELS = ("info", "warning", "error")
 
 
 class CaneAlerts:
-    def __init__(self, cloud, audio=None, queue_path=QUEUE_FILE, sos_pin=SOS_PIN):
+    def __init__(self, cloud, audio=None, queue_path=QUEUE_FILE, sos_pin=SOS_PIN, frame_provider=None):
         """cloud: a cane_cloud.CaneCloud. audio: optional pi_audio.AudioOutput
-        (used to speak SOS feedback). sos_pin=None disables the button."""
+        (used to speak SOS feedback). sos_pin=None disables the button.
+        frame_provider: zero-arg callable returning the latest BGR camera frame
+        (or None); used for the SOS photo. None = SOS without a photo."""
         self.cloud = cloud
+        self.frame_provider = frame_provider
         self.audio = audio
         self.path = queue_path
         self.sos_pin = sos_pin
@@ -86,9 +95,9 @@ class CaneAlerts:
         with self._lock:
             self._items.append({"rpc": rpc, "payload": payload, "ts": time.time()})
             while len(self._items) > MAX_QUEUE:
-                idx = next((i for i, it in enumerate(self._items)
-                            if it["rpc"] == "device_log"), 0)
-                self._items.pop(idx)
+                idx = next((i for i, it in enumerate(self._items) if it["rpc"] == "device_log"),
+                           next((i for i, it in enumerate(self._items) if it["rpc"] == "sos_photo"), 0))
+                self._discard_photo(self._items.pop(idx))
             self._save_locked()
         self._wake.set()
 
@@ -108,6 +117,15 @@ class CaneAlerts:
             except ValueError:
                 return
             self._save_locked()
+        self._discard_photo(item)
+
+    @staticmethod
+    def _discard_photo(item):
+        if item.get("rpc") == "sos_photo":
+            try:
+                os.remove(item["payload"].get("file") or "")
+            except (OSError, TypeError):
+                pass
 
     def pending(self):
         with self._lock:
@@ -126,9 +144,68 @@ class CaneAlerts:
             raise ValueError(f"level must be one of {LEVELS}")
         self._enqueue("device_log", {"p_level": level, "p_message": message})
 
+    def _queue_photo(self):
+        """Grab the current camera frame NOW (at the moment of the press) and
+        queue it. Never raises: SOS must work even if the photo can't."""
+        if self.frame_provider is None:
+            return
+        try:
+            frame = self.frame_provider()
+            if frame is None:
+                print("[alert] no camera frame available, SOS goes without a photo")
+                return
+            import cv2
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, PHOTO_JPEG_QUALITY])
+            if not ok:
+                return
+            os.makedirs(PHOTO_DIR, exist_ok=True)
+            path = os.path.join(PHOTO_DIR, f"{int(time.time() * 1000)}.jpg")
+            with open(path, "wb") as f:
+                f.write(buf.tobytes())
+            self._enqueue("sos_photo", {"file": path})
+            print("[alert] queued SOS photo")
+        except Exception as e:
+            print(f"[alert] could not queue SOS photo: {e}")
+
     # ----------------------------------------------------------------- sender
+    def _send_photo(self, item):
+        c = self.cloud
+        if not c.configured:
+            return "retry"
+        try:
+            with open(item["payload"]["file"], "rb") as f:
+                jpeg = f.read()
+        except (OSError, KeyError, TypeError):
+            return "drop"                       # file is gone, nothing to send
+        try:
+            r = requests.post(
+                f"{c.url}/functions/v1/cane-sos-photo",
+                headers={"apikey": c.anon_key, "Authorization": f"Bearer {c.anon_key}"},
+                data={"device_id": c.device_id, "secret": c.secret},
+                files={"image": ("sos.jpg", jpeg, "image/jpeg")},
+                timeout=20,
+            )
+        except requests.RequestException:
+            return "retry"
+        if r.ok:
+            print("[alert] SOS photo uploaded")
+            return "ok"
+        if r.status_code == 409:                # SOS log not there (yet)
+            item["tries"] = item.get("tries", 0) + 1
+            if item["tries"] >= PHOTO_MAX_TRIES:
+                print("[alert] no SOS log to attach the photo to (dropping photo)")
+                return "drop"
+            return "retry"
+        if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
+            print(f"[alert] photo refused (dropping): HTTP {r.status_code} {r.text[:200]}")
+            return "drop"
+        print(f"[alert] photo upload HTTP {r.status_code}, will retry")
+        return "retry"
+
     def _send(self, item):
         """Returns 'ok', 'drop' (never going to work) or 'retry'."""
+        if item["rpc"] == "sos_photo":
+            return self._send_photo(item)
         c = self.cloud
         if not c.configured:
             return "retry"
@@ -189,6 +266,7 @@ class CaneAlerts:
             return
         self._last_sos = now
         self.emergency("sos", "SOS button pressed")
+        self._queue_photo()          # queued AFTER the SOS, so the SOS always goes first
         self._say("S O S. Sending alert.")
 
     def _start_button(self):

@@ -13,8 +13,9 @@ What it does, all on the Raspberry Pi (no laptop, no server):
   3. Browser view: open http://<pi-ip>:5000/ for the live annotated video
      (boxes + labels + IDs). Detection and speech run all the time in the
      background -- they do NOT depend on anyone having the page open.
-  4. Alerts: a hold-to-fire SOS button and camera-fault alerts are queued on
-     disk and sent to Supabase (cane_alerts.py), even after Wi-Fi returns.
+  4. Alerts: a hold-to-fire SOS button (with a photo of what the camera sees)
+     and camera-fault alerts are queued on disk and sent to Supabase
+     (cane_alerts.py), even after Wi-Fi returns.
   5. Online status: a heartbeat tells Supabase the cane is alive, and
      marks it offline on a normal shutdown (cane_cloud.py). Skipped with a
      note if cane.env isn't set up.
@@ -112,7 +113,7 @@ def draw_boxes(frame, detections):
 # ----------------------------------------------------------------------
 # background loop: capture -> detect -> gather -> speak (+ feed the browser)
 # ----------------------------------------------------------------------
-def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, alerts=None):
+def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, alerts=None, frame_box=None):
     min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
     read_failures = 0
 
@@ -130,6 +131,8 @@ def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, a
                 time.sleep(0.1)
                 continue
             read_failures = 0
+            if frame_box is not None:
+                frame_box["frame"] = frame   # newest frame, used for the SOS photo
 
             detections = detector.detect(frame)
             announcer.add(detections)
@@ -278,14 +281,15 @@ def main(args):
         print(f"[warn] Speech disabled: {e}\n       (video + detection will still run)")
 
     # SOS button + queued emergency/log uploads to Supabase (works offline, sends later).
-    alerts = CaneAlerts(cloud, audio=audio)
+    frame_box = {"frame": None}
+    alerts = CaneAlerts(cloud, audio=audio, frame_provider=lambda: frame_box["frame"])
     alerts.start()
     alerts.log("info", "Cane started")
 
     stop = threading.Event()
     worker = threading.Thread(
         target=detection_loop,
-        args=(stop, cap, detector, announcer, audio, args.max_fps, args.cooldown, alerts),
+        args=(stop, cap, detector, announcer, audio, args.max_fps, args.cooldown, alerts, frame_box),
         name="detection", daemon=True,
     )
     worker.start()
