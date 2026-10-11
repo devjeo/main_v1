@@ -135,7 +135,18 @@ def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, a
                 frame_box["frame"] = frame   # newest frame, used for the SOS photo
 
             detections = detector.detect(frame)
-            announcer.add(detections)
+
+            # Center takes priority for people: while anyone is straight ahead,
+            # people on the left/right are not fed to the announcer, so they are
+            # neither spoken nor start a cooldown. (The narration step only sees
+            # newly announced objects, so this has to happen here.) The browser
+            # view below still draws every detection.
+            if any(d.label == "person" and d.position == "center" for d in detections):
+                for_speech = [d for d in detections
+                              if not (d.label == "person" and d.position != "center")]
+            else:
+                for_speech = detections
+            announcer.add(for_speech)
 
             result = announcer.poll()
             if result is not None:

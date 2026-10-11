@@ -46,6 +46,14 @@ def template_narrate(detections: List[Detection]) -> str:
     if not detections:
         return ""
 
+    # Center takes priority for people: if anyone is straight ahead, people on
+    # the left/right are left out so the sentence doesn't read out every
+    # direction. With nobody in the center, people at the sides are still
+    # announced. Other objects are never filtered.
+    if any(d.label == "person" and d.position == "center" for d in detections):
+        detections = [d for d in detections
+                      if not (d.label == "person" and d.position != "center")]
+
     by_position: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for d in detections:
         by_position[d.position][d.label] += 1
