@@ -6,11 +6,9 @@ ai_stream.py -- THE MAIN PROGRAM. Run this one file and everything starts:
 What it does, all on the Raspberry Pi (no laptop, no server):
 
   1. Camera + YOLO (NCNN) + tracker: every detected object gets an ID.
-  2. Speech: new objects are gathered until the scene settles (2.5 s with no
-     new arrivals; 0.5 s for urgent ones like vehicles or a person straight
-     ahead), then spoken through Piper as ONE sentence describing the whole
-     current scene. The same object ID is never re-triggered within 10
-     seconds (a second phone is a new ID, so it IS announced).
+  2. Speech: objects are gathered for 3 seconds, then the NEW ones are
+     spoken through Piper. The same object ID is never repeated within
+     10 seconds (a second phone is a new ID, so it IS announced).
      Rules live in object_announcer.py.
   3. Browser view: open http://<pi-ip>:5000/ for the live annotated video
      (boxes + labels + IDs). Detection and speech run all the time in the
@@ -101,14 +99,46 @@ def open_camera():
     return cap
 
 
+# BGR colors (OpenCV uses BGR, not RGB)
+ZONE_COLORS = {
+    "left":   (0, 0, 255),    # red
+    "center": (0, 255, 0),    # green
+    "right":  (255, 0, 0),    # blue
+}
+# Must match bbox_position() in detection_common.py
+LEFT_EDGE, RIGHT_EDGE = 0.33, 0.66
+
+
 def draw_boxes(frame, detections):
     out = frame.copy()
+    h, w = out.shape[:2]
+    lx, rx = int(w * LEFT_EDGE), int(w * RIGHT_EDGE)
+
+    # Zone header bar: LEFT | CENTER | RIGHT
+    bar_h = 22
+    bar = out.copy()
+    cv2.rectangle(bar, (0, 0), (lx, bar_h), ZONE_COLORS["left"], -1)
+    cv2.rectangle(bar, (lx, 0), (rx, bar_h), ZONE_COLORS["center"], -1)
+    cv2.rectangle(bar, (rx, 0), (w, bar_h), ZONE_COLORS["right"], -1)
+    out = cv2.addWeighted(bar, 0.5, out, 0.5, 0)
+    for text, x0, x1 in (("LEFT", 0, lx), ("CENTER", lx, rx), ("RIGHT", rx, w)):
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.putText(out, text, (x0 + (x1 - x0 - tw) // 2, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+    # Divider lines between the zones
+    cv2.line(out, (lx, bar_h), (lx, h), (255, 255, 255), 1)
+    cv2.line(out, (rx, bar_h), (rx, h), (255, 255, 255), 1)
+
+    # Boxes, colored by zone
     for d in detections:
+        color = ZONE_COLORS.get(d.position, (255, 255, 255))
         x1, y1, x2, y2 = (int(v) for v in d.bbox)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 255, 136), 2)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.circle(out, ((x1 + x2) // 2, (y1 + y2) // 2), 4, color, -1)  # the point that decides the zone
         tag = f"{d.label} #{d.track_id}" if d.track_id is not None else d.label
-        cv2.putText(out, tag, (x1, max(y1 - 6, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 136), 1)
+        cv2.putText(out, f"{tag} [{d.position}]", (x1, max(y1 - 6, bar_h + 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return out
 
 
@@ -153,14 +183,10 @@ def detection_loop(stop, cap, detector, announcer, audio, max_fps, cooldown_s, a
             result = announcer.poll()
             if result is not None:
                 if result.announce:
-                    # Describe the WHOLE current scene (new + still-in-cooldown
-                    # objects) so counts are right: "4 persons ahead", not
-                    # "2 persons ahead" twice.
-                    scene = result.announce + result.suppressed
-                    text = template_narrate(scene)
+                    text = template_narrate(result.announce)
                     print(f"[say]  {text}")
                     if audio is not None:
-                        audio.speak(text, Priority.NARRATION, objects=scene)
+                        audio.speak(text, Priority.NARRATION, objects=result.announce)
                 if result.suppressed:
                     held = ", ".join(f"{d.label}#{d.track_id}" for d in result.suppressed)
                     print(f"[held] announced < {cooldown_s:g}s ago: {held}")
@@ -262,13 +288,7 @@ def parse_args():
     p.add_argument("--conf", type=float, default=0.5, help="detection confidence threshold")
     p.add_argument("--imgsz", type=int, default=320, help="inference image size")
     p.add_argument("--max-fps", type=float, default=10, help="cap on detection frames/sec (leaves CPU for speech)")
-    p.add_argument("--window", type=float, default=3.0, help="housekeeping interval (s) when nothing new is pending")
-    p.add_argument("--settle", type=float, default=2.5,
-                   help="speak after no NEW object has appeared for this many seconds")
-    p.add_argument("--urgent-settle", type=float, default=0.5,
-                   help="shorter settle (s) for urgent objects (vehicles, animals, a person straight ahead)")
-    p.add_argument("--max-wait", type=float, default=6.0,
-                   help="never hold new objects longer than this many seconds before speaking")
+    p.add_argument("--window", type=float, default=3.0, help="gather window in seconds")
     p.add_argument("--cooldown", type=float, default=10.0, help="seconds before the SAME object ID may be spoken again")
     p.add_argument("--tracker", default="bytetrack.yaml",
                    help="bytetrack.yaml (lighter) or botsort.yaml (better with camera motion, more CPU)")
@@ -294,9 +314,7 @@ def main(args):
     detector = LocalTracker(model_path=args.model, confidence=args.conf,
                             imgsz=args.imgsz, tracker=args.tracker,
                             labels=None if args.all_objects else ALLOWED_LABELS)
-    announcer = ObjectAnnouncer(window_s=args.window, cooldown_s=args.cooldown,
-                                settle_s=args.settle, urgent_settle_s=args.urgent_settle,
-                                max_wait_s=args.max_wait)
+    announcer = ObjectAnnouncer(window_s=args.window, cooldown_s=args.cooldown)
 
     audio = None
     try:
@@ -320,8 +338,7 @@ def main(args):
     worker.start()
 
     print(f"\nRunning. Live view: http://<pi-ip>:{PORT}/   (Ctrl+C to stop)")
-    print(f"Speaking after {args.settle:g}s of no new objects ({args.urgent_settle:g}s for urgent ones, "
-          f"max {args.max_wait:g}s); same object ID won't repeat within {args.cooldown:g}s.\n")
+    print(f"Gathering {args.window:g}s windows; same object ID won't repeat within {args.cooldown:g}s.\n")
 
     try:
         app.run(host=HOST, port=PORT, debug=False, threaded=True)
